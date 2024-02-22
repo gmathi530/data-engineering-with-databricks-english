@@ -1,0 +1,201 @@
+# Databricks notebook source
+spark
+
+# COMMAND ----------
+
+spark.conf.set("spark.databricks.io.cache.enabled", "false")
+
+# COMMAND ----------
+
+sql_statement = """
+WITH CTE AS (
+SELECT 
+    CAST(ABS(RAND() * 50000000) AS INT) AS id,
+    CAST(ABS(RAND() * 40) AS INT) + 60 AS heart_rate 
+FROM RANGE(100000000)
+)
+SELECT id, CONCAT('Person ', id) AS name, heart_rate
+FROM CTE
+"""
+spark.sql(sql_statement).limit(5).display()
+
+# COMMAND ----------
+
+spark.sql(sql_statement).write.mode("overwrite").saveAsTable("source")
+
+# COMMAND ----------
+
+display(dbutils.fs.ls("dbfs:/user/hive/warehouse/source"))
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT * FROM source WHERE id = 1000
+
+# COMMAND ----------
+
+import pyspark.sql.functions as F
+from pyspark.sql.types import StructType, StructField, StringType, LongType
+def display_stats_for_commit(commit_path):
+    col_values = StructType([ 
+        StructField("id",LongType(),True),
+        StructField("name",StringType(),True),
+        StructField("heart_rate",LongType(),True)
+      ])
+    schema = StructType([ 
+        StructField("numRecords", LongType(),True),
+        StructField("minValues", col_values, True),
+        StructField("maxValues", col_values, True)
+      ])
+    (spark.read.json(commit_path)
+        .select("add")
+        .where("add is not null")
+        .selectExpr("add.path", "add.size", "add.stats")
+        .withColumn("stats", F.from_json(F.col("stats"), schema))
+        .withColumn("numRecords", F.expr("stats.numRecords"))
+        .withColumn("min_id", F.expr("stats.minValues.id"))
+        .withColumn("max_id", F.expr("stats.maxValues.id"))
+        .drop("stats")
+        .orderBy("path")
+        .display()
+    )
+
+# COMMAND ----------
+
+
+display_stats_for_commit("dbfs:/user/hive/warehouse/source/_delta_log/00000000000000000000.json")
+
+# COMMAND ----------
+
+
+spark.table("source").repartition(8, "id").write.mode("overwrite").saveAsTable("repartitioned_by_id")
+display_stats_for_commit("dbfs:/user/hive/warehouse/repartitioned_by_id/_delta_log/00000000000000000000.json")
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT * FROM source WHERE id = 1000
+
+# COMMAND ----------
+
+
+spark.table("source").repartitionByRange(8, "id").write.mode("overwrite").saveAsTable("range_partitioned_by_id")
+display_stats_for_commit("dbfs:/user/hive/warehouse/range_partitioned_by_id/_delta_log/00000000000000000000.json")
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT * FROM source WHERE id = 1000
+
+# COMMAND ----------
+
+import pyspark.sql.functions as F
+df1 = spark.range(4).withColumnRenamed("id", "x")
+df2 = spark.range(4).withColumnRenamed("id", "y")
+df3 = df1.crossJoin(df2)
+df3 = df3.repartitionByRange(2, "x", "y").withColumn("partition", F.spark_partition_id())
+df3.orderBy("x", "y").show()
+
+# COMMAND ----------
+
+import itertools
+from typing import List
+from pprint import pprint
+from dataclasses import dataclass
+@dataclass
+class DataItem:
+    x: int
+    y: int
+@dataclass
+class FileInfo:
+    items: List[DataItem]
+    minx: int = None
+    miny: int = None
+    maxx: int = None
+    maxy: int = None
+    
+cross_product = list(itertools.product(range(8), range(8)))
+items = [DataItem(d[0], d[1])  for d in cross_product]
+pprint(items[:4])
+
+# COMMAND ----------
+
+def adjust_file_info(file: FileInfo, item: DataItem):
+    if file.minx is None or file.minx > item.x:
+        file.minx = item.x
+    if file.miny is None or file.miny > item.y:
+        file.miny = item.y
+    if file.maxx is None or file.maxx < item.x:
+        file.maxx = item.x
+    if file.maxy is None or file.maxy < item.y:
+        file.maxy = item.y
+def calculate_data_linear_placement(items: List[DataItem]):
+    files = {}
+    for index, item in enumerate(items):
+        order = index // 4
+        if not order in files:
+            files[order] = FileInfo([])
+        file = files[order]
+        file.items.append(item)
+        adjust_file_info(file, item)
+        
+    return files
+linear_organised_files = calculate_data_linear_placement(items)
+pprint(linear_organised_files)
+
+# COMMAND ----------
+
+def find_stats_for_records_matching_x_or_y(files, x, y):
+    files_scanned = 0
+    false_positives = 0
+    for k in files.keys():
+        file = files[k]
+        if not ((file.minx <= x and file.maxx >= x) or (file.miny <= y and file.maxy >=y)):
+            continue
+        files_scanned += 1
+        for item in file.items:
+            if item.x != x and item.y != y:
+                false_positives += 1
+    print(f"files_scanned : {files_scanned}")
+    print(f"false_positives: {false_positives}")
+find_stats_for_records_matching_x_or_y(linear_organised_files, 2, 3)
+
+# COMMAND ----------
+
+
+def calculate_data_zorder_placement(items: List[DataItem]):
+    files = {}
+    for index, item in enumerate(items):
+        x, y = item.x, item.y
+        xb = f"{x:>03b}"
+        yb = f"{y:>03b}"
+        interleaved = f"{yb[0]}{xb[0]}{yb[1]}{xb[1]}{yb[2]}{xb[2]}"
+        zorder = int(interleaved, 2)
+        file_placement = zorder // 4
+        if not file_placement in files:
+            files[file_placement] = FileInfo([])
+        file = files[file_placement]
+        file.items.append(item)
+        adjust_file_info(file, item)
+        
+    return files
+zorder_organised_files = calculate_data_zorder_placement(items)
+pprint(zorder_organised_files)
+
+# COMMAND ----------
+
+find_stats_for_records_matching_x_or_y(zorder_organised_files, 2, 3)
+
+# COMMAND ----------
+
+spark.conf.set("spark.databricks.delta.optimize.maxFileSize", str(1024 * 1024 * 160))
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC OPTIMIZE source ZORDER BY (id)
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT * FROM source WHERE id = 1000
